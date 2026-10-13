@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% if unread_count %}({{ unread_count }}) {% endif %}SMS Inbox</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.2.0/css/all.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', system-ui, sans-serif; }
+        .clamp { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+        .toast { transition: opacity .3s ease, transform .3s ease; }
+        .toast.leaving { opacity: 0; transform: translateY(-8px); }
+        #bulk-bar { transition: transform .25s ease, opacity .25s ease; }
+        #bulk-bar.closed { transform: translate(-50%, 150%); opacity: 0; pointer-events: none; }
+        .message.is-selected { background-color: rgb(238 242 255); }
+        @media (prefers-color-scheme: dark) { .message.is-selected { background-color: rgb(30 27 75 / .5); } }
+        dialog::backdrop { background: rgb(0 0 0 / .5); }
+        dialog[open] { animation: pop .15s ease-out; }
+        @keyframes pop { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: scale(1); } }
+    </style>
+</head>
+<body class="bg-slate-100 text-slate-800 dark:bg-slate-950 dark:text-slate-200 min-h-screen">
+
+    <!-- Top bar -->
+    <header class="sticky top-0 z-30 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-b border-slate-200 dark:border-slate-800">
+        <div class="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between gap-4">
+            <div class="flex items-center gap-3 min-w-0">
+                <div class="h-9 w-9 shrink-0 rounded-lg bg-indigo-600 text-white flex items-center justify-center">
+                    <i class="fas fa-comment-sms"></i>
+                </div>
+                <div class="min-w-0">
+                    <h1 class="font-semibold text-slate-900 dark:text-white leading-tight">SMS Inbox</h1>
+                    <p class="text-xs text-slate-500 dark:text-slate-400 truncate">
+                        {{ messages|length }} message{{ '' if messages|length == 1 else 's' }}
+                        {% if unread_count %}· <span class="text-indigo-600 dark:text-indigo-400 font-medium">{{ unread_count }} unread</span>{% endif %}
+                    </p>
+                </div>
+            </div>
+            <a href="{{ url_for('index') }}" class="inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500" title="Refresh (R)">
+                <i class="fas fa-rotate-right"></i><span class="hidden sm:inline">Refresh</span>
+            </a>
+        </div>
+    </header>
+
+    <!-- Toasts -->
+    <div id="toasts" class="fixed top-20 right-4 left-4 sm:left-auto z-50 flex flex-col gap-2 sm:w-96" aria-live="polite">
+        {% with flashes = get_flashed_messages(with_categories=true) %}
+            {% for category, text in flashes %}
+            <div class="toast flex items-start gap-3 rounded-lg p-4 shadow-lg ring-1 {{ 'bg-emerald-50 text-emerald-900 ring-emerald-200 dark:bg-emerald-950 dark:text-emerald-100 dark:ring-emerald-800' if category == 'success' else 'bg-red-50 text-red-900 ring-red-200 dark:bg-red-950 dark:text-red-100 dark:ring-red-800' }}"
+                 role="{{ 'status' if category == 'success' else 'alert' }}" data-autohide="{{ 'true' if category == 'success' else 'false' }}">
+                <i class="fas {{ 'fa-circle-check text-emerald-500' if category == 'success' else 'fa-triangle-exclamation text-red-500' }} mt-0.5"></i>
+                <p class="flex-1 text-sm">{{ text }}</p>
+                <button type="button" class="toast-close opacity-60 hover:opacity-100" aria-label="Dismiss"><i class="fas fa-xmark"></i></button>
+            </div>
+            {% endfor %}
+        {% endwith %}
+    </div>
+
+    <main class="max-w-4xl mx-auto px-4 py-6 pb-32">
+        {% if messages %}
+        <!-- Toolbar -->
+        <div class="flex flex-col sm:flex-row gap-3 mb-4">
+            <div class="relative flex-1">
+                <i class="fas fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
+                <input id="search" type="search" placeholder="Search sender or text…  ( / )" autocomplete="off"
+                       class="w-full rounded-lg border-0 bg-white dark:bg-slate-900 py-2.5 pl-9 pr-3 text-sm ring-1 ring-slate-200 dark:ring-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            </div>
+            <div class="inline-flex rounded-lg bg-white dark:bg-slate-900 p-1 ring-1 ring-slate-200 dark:ring-slate-800 text-sm" role="tablist" aria-label="Filter messages">
+                {% for key, label, count in [('all', 'All', messages|length), ('unread', 'Unread', unread_count), ('read', 'Read', messages|length - unread_count)] %}
+                <button type="button" data-filter="{{ key }}" role="tab"
+                        class="filter-btn flex-1 sm:flex-none rounded-md px-3 py-1.5 font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white">
+                    {{ label }} <span class="ml-1 text-xs opacity-60">{{ count }}</span>
+                </button>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        <form id="bulk-form" action="{{ url_for('bulk_action') }}" method="POST">
+            <input type="hidden" name="action" id="bulk-action-input">
+
+            {% if messages %}
+            <div class="bg-white dark:bg-slate-900 rounded-xl ring-1 ring-slate-200 dark:ring-slate-800 overflow-hidden">
+                <div class="flex items-center gap-3 px-4 py-2.5 border-b border-slate-100 dark:border-slate-800 text-sm text-slate-500 dark:text-slate-400">
+                    <input type="checkbox" id="select-all" class="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" aria-label="Select all visible messages">
+                    <label for="select-all" class="select-none">Select all</label>
+                    <span id="visible-count" class="ml-auto text-xs"></span>
+                </div>
+
+                <ul id="message-list" class="divide-y divide-slate-100 dark:divide-slate-800">
+                    {% for m in messages %}
+                    {% set unread = m.Processed == 'false' %}
+                    <li class="message group relative flex gap-3 px-4 py-4 transition-colors hover:bg-slate-50 dark:hover:bg-slate-800/50 {{ 'bg-indigo-50/40 dark:bg-indigo-950/20' if unread }}"
+                        data-unread="{{ 'true' if unread else 'false' }}"
+                        data-ids="{{ m.ids|join(',') }}"
+                        data-search="{{ (m.SenderNumber ~ ' ' ~ m.TextDecoded)|lower }}">
+                        {% if unread %}<span class="absolute left-0 top-0 bottom-0 w-1 bg-indigo-500" aria-hidden="true"></span>{% endif %}
+                        <input type="checkbox" name="message_ids" value="{{ m.ids|join(',') }}"
+                               class="message-checkbox mt-1 h-4 w-4 shrink-0 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                               aria-label="Select message from {{ m.SenderNumber }}">
+                        <div class="min-w-0 flex-1">
+                            <div class="flex items-baseline justify-between gap-3">
+                                <div class="flex items-center gap-2 min-w-0">
+                                    <span class="truncate {{ 'font-semibold text-slate-900 dark:text-white' if unread else 'font-medium text-slate-700 dark:text-slate-300' }}">{{ m.SenderNumber }}</span>
+                                    {% if unread %}<span class="shrink-0 rounded-full bg-indigo-100 dark:bg-indigo-900 px-2 py-0.5 text-[11px] font-semibold text-indigo-700 dark:text-indigo-300">New</span>{% endif %}
+                                    {% if m.ids|length > 1 %}<span class="shrink-0 text-[11px] text-slate-400" title="Assembled from {{ m.ids|length }} parts"><i class="fas fa-layer-group"></i> {{ m.ids|length }}</span>{% endif %}
+                                </div>
+                                <time class="shrink-0 text-xs text-slate-400" title="{{ m.ReceivingDateTime.strftime('%A, %B %d, %Y at %H:%M:%S') }}">{{ m.received_label }}</time>
+                            </div>
+                            <p class="message-text clamp mt-1 text-sm whitespace-pre-line break-words {{ 'text-slate-700 dark:text-slate-200' if unread else 'text-slate-500 dark:text-slate-400' }}">{{ m.TextDecoded }}</p>
+                            <button type="button" class="expand-btn hidden mt-1 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline">Show more</button>
+
+<button type="button" class="copy-code-btn hidden mt-2 items-center gap-1.5 rounded-md bg-amber-100 dark:bg-amber-900/40 px-2 py-1 text-xs font-semibold text-amber-800 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-900/70">
+                                <i class="fas fa-key"></i><span class="code-label"></span><i class="far fa-copy opacity-60"></i>
+                            </button>
+
+                            <div class="mt-2 flex items-center gap-1 sm:mt-0 sm:absolute sm:right-3 sm:top-2.5 sm:rounded-lg sm:bg-white sm:dark:bg-slate-800 sm:p-0.5 sm:shadow-sm sm:ring-1 sm:ring-slate-200 sm:dark:ring-slate-700 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100 transition-opacity">
+                                <button type="button" class="copy-btn action-btn" title="Copy text" aria-label="Copy text"><i class="far fa-copy"></i><span class="sm:hidden">Copy</span></button>
+                                {% if unread %}
+                                <button type="button" class="action-btn" title="Mark as read" aria-label="Mark as read" onclick="runAction('read', '{{ m.ids|join(',') }}')"><i class="fas fa-check"></i><span class="sm:hidden">Mark read</span></button>
+                                {% endif %}
+                                <button type="button" class="action-btn hover:!text-red-600 dark:hover:!text-red-400" title="Delete (D)" aria-label="Delete" onclick="confirmDelete('{{ m.ids|join(',') }}')"><i class="far fa-trash-can"></i><span class="sm:hidden">Delete</span></button>
+                            </div>
+                        </div>
+                    </li>
+                    {% endfor %}
+                </ul>
+
+                <div id="no-results" class="hidden text-center py-12 text-slate-500 dark:text-slate-400">
+                    <i class="fas fa-filter-circle-xmark text-3xl text-slate-300 dark:text-slate-700 mb-3"></i>
+                    <p class="font-medium">No messages match</p>
+                    <button type="button" id="clear-filters" class="mt-2 text-sm text-indigo-600 dark:text-indigo-400 hover:underline">Clear filters</button>
+                </div>
+            </div>
+            {% else %}
+            <div class="text-center py-20 bg-white dark:bg-slate-900 rounded-xl ring-1 ring-slate-200 dark:ring-slate-800">
+                <div class="mx-auto mb-4 h-16 w-16 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
+                    <i class="fas fa-inbox text-2xl text-slate-400"></i>
+                </div>
+                <h2 class="text-lg font-semibold text-slate-800 dark:text-slate-100">{{ 'Could not load messages' if db_error else 'Inbox is empty' }}</h2>
+                <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">{{ 'Check the database connection and try again.' if db_error else 'New messages will appear here.' }}</p>
+                <a href="{{ url_for('index') }}" class="mt-5 inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700">
+                    <i class="fas fa-rotate-right"></i>Refresh
+                </a>
+            </div>
+            {% endif %}
+
+            <!-- Bulk action bar -->
+            <div id="bulk-bar" class="closed fixed bottom-6 left-1/2 -translate-x-1/2 z-40 w-[calc(100%-2rem)] max-w-xl rounded-xl bg-slate-900 dark:bg-slate-800 text-white shadow-2xl ring-1 ring-black/10 px-4 py-3 flex items-center gap-3">
+                <button type="button" id="clear-selection" class="h-8 w-8 rounded-md hover:bg-white/10" title="Clear selection (Esc)" aria-label="Clear selection"><i class="fas fa-xmark"></i></button>
+                <span id="selection-count" class="text-sm font-medium flex-1">0 selected</span>
+                <button type="button" onclick="submitBulk('read')" class="inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-white/10">
+                    <i class="fas fa-check"></i><span class="hidden sm:inline">Mark read</span>
+                </button>
+                <button type="button" onclick="confirmBulkDelete()" class="inline-flex items-center gap-2 rounded-lg bg-red-600 px-3 py-2 text-sm font-medium hover:bg-red-700">
+                    <i class="far fa-trash-can"></i><span class="hidden sm:inline">Delete</span>
+                </button>
+            </div>
+        </form>
+
+        <!-- Standalone form for single-message actions -->
+        <form id="single-form" action="{{ url_for('bulk_action') }}" method="POST" class="hidden">
+            <input type="hidden" name="action">
+            <input type="hidden" name="message_ids">
+        </form>
+    </main>
+
+    <!-- Delete confirmation -->
+    <dialog id="delete-dialog" class="rounded-xl p-0 w-[calc(100%-2rem)] max-w-sm bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 shadow-2xl">
+        <div class="p-6 text-center">
+            <div class="mx-auto flex items-center justify-center h-12 w-12 rounded-full bg-red-100 dark:bg-red-950">
+                <i class="far fa-trash-can text-lg text-red-600 dark:text-red-400"></i>
+            </div>
+            <h3 id="delete-title" class="mt-4 text-lg font-semibold text-slate-900 dark:text-white">Delete message?</h3>
+            <p class="mt-2 text-sm text-slate-500 dark:text-slate-400">This permanently removes it from the database and cannot be undone.</p>
+        </div>
+        <div class="grid grid-cols-2 gap-3 px-6 pb-6">
+            <button type="button" id="delete-cancel" class="rounded-lg px-4 py-2 text-sm font-medium ring-1 ring-slate-300 dark:ring-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800" autofocus>Cancel</button>
+            <button type="button" id="delete-confirm" class="rounded-lg px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700">Delete</button>
+        </div>
+    </dialog>
+
+    <style type="text/tailwindcss">
+        .action-btn { @apply inline-flex items-center gap-1.5 rounded-md px-2 py-1 sm:px-2.5 sm:py-1.5 text-xs font-medium text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500; }
+    </style>
+
+    <script>
+    (function () {
+        const $ = (s, el = document) => el.querySelector(s);
+        const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
+
+        const store = {
+            get(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } },
+            set(k, v) { try { sessionStorage.setItem(k, v); } catch (e) {} },
+        };
+
+        // ---- Toasts ----
+        function dismissToast(t) {
+            t.classList.add('leaving');
+            setTimeout(() => t.remove(), 300);
+        }
+        function toast(text) {
+            const t = document.createElement('div');
+            t.className = 'toast flex items-center gap-3 rounded-lg p-3 shadow-lg ring-1 bg-slate-900 text-white ring-black/10 text-sm';
+            t.setAttribute('role', 'status');
+            t.innerHTML = '<i class="fas fa-circle-check text-emerald-400"></i><span></span>';
+            t.querySelector('span').textContent = text;
+            $('#toasts').appendChild(t);
+            setTimeout(() => dismissToast(t), 2000);
+        }
+        $$('#toasts .toast').forEach(t => {
+            $('.toast-close', t)?.addEventListener('click', () => dismissToast(t));
+            if (t.dataset.autohide === 'true') setTimeout(() => dismissToast(t), 4000);
+        });
+
+        // ---- Clipboard ----
+        async function copy(text, label) {
+            try {
+                await navigator.clipboard.writeText(text);
+            } catch (e) {
+                // Fallback for non-secure (http) contexts where the Clipboard API is unavailable
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                ta.remove();
+            }
+            toast(label);
+        }
+
+        const CODE_HINT = /(code|otp|pin|passcode|password|verif|token|tan|kod|کد|رمز)/i;
+        const CODE_RE = /(?:^|[^\d])(\d{4,8})(?!\d)/;
+
+        const items = $$('.message');
+        items.forEach(li => {
+            const textEl = $('.message-text', li);
+            const text = textEl.textContent;
+
+            $('.copy-btn', li).addEventListener('click', () => copy(text, 'Message copied'));
+
+            if (CODE_HINT.test(text)) {
+                const m = text.match(CODE_RE);
+                if (m) {
+                    const btn = $('.copy-code-btn', li);
+                    $('.code-label', btn).textContent = m[1];
+                    btn.title = 'Copy code';
+                    btn.classList.remove('hidden');
+                    btn.classList.add('inline-flex');
+                    btn.addEventListener('click', () => copy(m[1], `Code ${m[1]} copied`));
+                }
+            }
+
+            const expand = $('.expand-btn', li);
+            if (textEl.scrollHeight > textEl.clientHeight + 1) {
+                expand.classList.remove('hidden');
+                expand.addEventListener('click', () => {
+                    const collapsed = textEl.classList.toggle('clamp');
+                    expand.textContent = collapsed ? 'Show more' : 'Show less';
+                });
+            }
+        });
+
+        // ---- Filtering ----
+        const search = $('#search');
+        let filter = store.get('sms-filter') || 'all';
+
+        function visibleItems() { return items.filter(li => !li.classList.contains('hidden')); }
+
+        function applyFilters() {
+            const q = (search?.value || '').trim().toLowerCase();
+            let shown = 0;
+            items.forEach(li => {
+                const okFilter = filter === 'all' || (filter === 'unread') === (li.dataset.unread === 'true');
+                const okSearch = !q || li.dataset.search.includes(q);
+                const hide = !(okFilter && okSearch);
+                li.classList.toggle('hidden', hide);
+                if (hide) $('.message-checkbox', li).checked = false;
+                else shown++;
+            });
+            $$('.filter-btn').forEach(b => {
+                const active = b.dataset.filter === filter;
+                b.setAttribute('aria-selected', active);
+                b.classList.toggle('bg-indigo-600', active);
+                b.classList.toggle('!text-white', active);
+            });
+            $('#no-results')?.classList.toggle('hidden', shown > 0 || !items.length);
+            const vc = $('#visible-count');
+            if (vc) vc.textContent = shown === items.length ? '' : `Showing ${shown} of ${items.length}`;
+            updateSelection();
+        }
+
+        $$('.filter-btn').forEach(b => b.addEventListener('click', () => {
+            filter = b.dataset.filter;
+            store.set('sms-filter', filter);
+            applyFilters();
+        }));
+        search?.addEventListener('input', applyFilters);
+        $('#clear-filters')?.addEventListener('click', () => {
+            filter = 'all';
+            store.set('sms-filter', filter);
+            if (search) search.value = '';
+            applyFilters();
+        });
+
+        // ---- Selection ----
+        const selectAll = $('#select-all');
+        const bulkBar = $('#bulk-bar');
+
+        function selected() { return $$('.message-checkbox:checked'); }
+
+        function updateSelection() {
+            const n = selected().length;
+            const visible = visibleItems().length;
+            if (selectAll) {
+                selectAll.checked = n > 0 && n === visible;
+                selectAll.indeterminate = n > 0 && n < visible;
+            }
+            bulkBar.classList.toggle('closed', n === 0);
+            $('#selection-count').textContent = `${n} selected`;
+            items.forEach(li => li.classList.toggle('is-selected', $('.message-checkbox', li).checked));
+        }
+
+        selectAll?.addEventListener('change', () => {
+            visibleItems().forEach(li => { $('.message-checkbox', li).checked = selectAll.checked; });
+            updateSelection();
+        });
+        $$('.message-checkbox').forEach(cb => cb.addEventListener('change', updateSelection));
+
+        function clearSelection() {
+            $$('.message-checkbox').forEach(cb => { cb.checked = false; });
+            updateSelection();
+        }
+        $('#clear-selection').addEventListener('click', clearSelection);
+
+        // ---- Actions ----
+        const bulkForm = $('#bulk-form');
+        const singleForm = $('#single-form');
+
+        window.submitBulk = function (action) {
+            $('#bulk-action-input').value = action;
+            bulkForm.submit();
+        };
+
+        window.runAction = function (action, ids) {
+            singleForm.elements.action.value = action;
+            singleForm.elements.message_ids.value = ids;
+            singleForm.submit();
+        };
+
+        const dialog = $('#delete-dialog');
+        let onConfirm = null;
+
+        function openDelete(count, cb, focusConfirm = false) {
+            $('#delete-title').textContent = count === 1 ? 'Delete message?' : `Delete ${count} messages?`;
+            onConfirm = cb;
+            dialog.showModal();
+            if (focusConfirm) $('#delete-confirm').focus();
+        }
+        window.confirmDelete = (ids, focusConfirm) => openDelete(1, () => runAction('delete', ids), focusConfirm);
+
+        // Track the message under the mouse pointer for the "D" shortcut
+        let hovered = null;
+        items.forEach(li => {
+            li.addEventListener('mouseenter', () => { hovered = li; });
+            li.addEventListener('mouseleave', () => { if (hovered === li) hovered = null; });
+        });
+        window.confirmBulkDelete = () => openDelete(selected().length, () => submitBulk('delete'));
+
+        $('#delete-cancel').addEventListener('click', () => dialog.close());
+        $('#delete-confirm').addEventListener('click', () => { dialog.close(); onConfirm && onConfirm(); });
+        dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+
+        // ---- Keyboard shortcuts ----
+        document.addEventListener('keydown', e => {
+            const plainKey = !e.ctrlKey && !e.metaKey && !e.altKey;
+            if (dialog.open) {
+                // Pressing D again confirms, so "D D" deletes the hovered message
+                if ((e.key === 'd' || e.key === 'D') && plainKey) {
+                    e.preventDefault();
+                    $('#delete-confirm').click();
+                }
+                return;
+            }
+            const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName) && document.activeElement.type !== 'checkbox';
+            if (e.key === '/' && !typing && search) {
+                e.preventDefault();
+                search.focus();
+            } else if (e.key === 'Escape') {
+                if (typing && search === document.activeElement && search.value) {
+                    search.value = '';
+                    applyFilters();
+                } else if (selected().length) {
+                    clearSelection();
+                }
+            } else if ((e.key === 'd' || e.key === 'D') && !typing && plainKey && hovered && !hovered.classList.contains('hidden')) {
+                e.preventDefault();
+                confirmDelete(hovered.dataset.ids, true);
+            } else if ((e.key === 'r' || e.key === 'R') && !typing && !e.ctrlKey && !e.metaKey) {
+                window.location.reload();
+            }
+        });
+
+        applyFilters();
+    })();
+    </script>
+</body>
+</html>

@@ -1,3 +1,4 @@
+import html
 import os
 import socket
 import ipaddress
@@ -6,9 +7,12 @@ import json
 import threading
 import time
 import urllib.request
+from collections import Counter
+from datetime import timedelta
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import mysql.connector
 import logging
@@ -37,6 +41,8 @@ DB_NAME = os.environ.get("DB_NAME", "")
 DB_USER = os.environ.get("DB_USER")
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
 SENT_IDS_FILE = os.environ.get("SENT_IDS_FILE") or os.path.join(os.path.dirname(__file__), "message_ids.txt")
+APP_PUBLIC_URL = os.environ.get("APP_PUBLIC_URL", "http://127.0.0.1:5000")
+BOT_STARTED_AT = time.time()
 
 
 def get_db_connection():
@@ -54,40 +60,83 @@ def get_db_connection():
         return None
 
 
-def mark_message_as_read(message_id: int) -> bool:
-    """Mark a specific message ID as read in the database."""
+def _ids_placeholders(message_ids):
+    return ', '.join(['%s'] * len(message_ids))
+
+
+def mark_message_as_read(message_ids: list[int]) -> bool:
+    """Mark the given message IDs (all parts of one SMS) as read."""
     conn = get_db_connection()
     if not conn:
         return False
     cursor = conn.cursor()
     try:
-        cursor.execute("UPDATE inbox SET Processed = 'true' WHERE ID = %s AND Processed = 'false'", (message_id,))
+        cursor.execute(
+            f"UPDATE inbox SET Processed = 'true' WHERE ID IN ({_ids_placeholders(message_ids)}) AND Processed = 'false'",
+            tuple(message_ids),
+        )
         conn.commit()
         return cursor.rowcount > 0
     except mysql.connector.Error as err:
-        logger.error("Error updating message %s: %s", message_id, err)
+        logger.error("Error updating messages %s: %s", message_ids, err)
         return False
     finally:
         cursor.close()
         conn.close()
 
 
-def delete_message(message_id: int) -> bool:
-    """Deletes a specific message ID from the database."""
+def delete_message(message_ids: list[int]) -> bool:
+    """Delete the given message IDs (all parts of one SMS) from the database."""
     conn = get_db_connection()
     if not conn:
         return False
     cursor = conn.cursor()
     try:
-        cursor.execute("DELETE FROM inbox WHERE ID = %s", (message_id,))
+        cursor.execute(f"DELETE FROM inbox WHERE ID IN ({_ids_placeholders(message_ids)})", tuple(message_ids))
         conn.commit()
         return cursor.rowcount > 0
     except mysql.connector.Error as err:
-        logger.error("Error deleting message %s: %s", message_id, err)
+        logger.error("Error deleting messages %s: %s", message_ids, err)
         return False
     finally:
         cursor.close()
         conn.close()
+
+
+def mark_all_as_read() -> list[int] | None:
+    """Mark every unread message as read. Returns the affected IDs, or None on error."""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT ID FROM inbox WHERE Processed = 'false'")
+        ids = [row[0] for row in cursor.fetchall()]
+        if ids:
+            cursor.execute(f"UPDATE inbox SET Processed = 'true' WHERE ID IN ({_ids_placeholders(ids)})", tuple(ids))
+            conn.commit()
+        return ids
+    except mysql.connector.Error as err:
+        logger.error("Error marking all messages as read: %s", err)
+        return None
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def message_ids_of(message) -> list[int]:
+    """All inbox row IDs that make up a (possibly multipart) message."""
+    return message.get('_part_ids') or [message['ID']]
+
+
+def callback_ids(message) -> str:
+    """Comma-joined part IDs for callback data, kept within Telegram's 64-byte limit."""
+    ids = ','.join(str(i) for i in message_ids_of(message))
+    return ids if len(ids) <= 56 else str(message['ID'])
+
+
+def parse_callback_ids(value: str) -> list[int]:
+    return [int(part) for part in value.split(',')]
 
 
 def remove_sent_ids(ids_to_remove):
@@ -109,21 +158,26 @@ def remove_sent_ids(ids_to_remove):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard button clicks."""
     query = update.callback_query
-    await query.answer()  # Acknowledge the button press
 
-    action, _, message_id_str = query.data.partition('_')
+    action, _, payload = query.data.partition('_')
+
+    if action == 'dash':
+        await handle_dashboard_callback(update, context, payload)
+        return
+
+    await query.answer()  # Acknowledge the button press
 
     if action == 'read':
         try:
-            message_id = int(message_id_str)
-            if mark_message_as_read(message_id):
+            message_ids = parse_callback_ids(payload)
+            if mark_message_as_read(message_ids):
                 # Edit the original message to remove the button
                 await query.edit_message_text(
                     text=query.message.text + "\n\n---\n✅ Marked as Read",
                     reply_markup=None  # Remove keyboard
                 )
-                logger.info("Marked message ID %s as read.", message_id)
-                remove_sent_ids([message_id])
+                logger.info("Marked message IDs %s as read.", message_ids)
+                remove_sent_ids(message_ids)
             else:
                 await query.edit_message_text(
                     text=query.message.text + "\n\n---\n⚠️ Already marked as read or error.",
@@ -136,14 +190,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     elif action == 'delete':
         try:
-            message_id = int(message_id_str)
-            if delete_message(message_id):
+            message_ids = parse_callback_ids(payload)
+            if delete_message(message_ids):
                 await query.edit_message_text(
                     text=query.message.text + "\n\n---\n🗑️ Message Deleted",
                     reply_markup=None
                 )
-                logger.info("Deleted message ID %s.", message_id)
-                remove_sent_ids([message_id])
+                logger.info("Deleted message IDs %s.", message_ids)
+                remove_sent_ids(message_ids)
             else:
                 await query.edit_message_text(
                     text=query.message.text + "\n\n---\n⚠️ Error deleting message or already deleted.",
@@ -156,9 +210,239 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+# --- Dashboard ---
+
+def _ago(delta: timedelta) -> str:
+    seconds = max(0, int(delta.total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60} min ago"
+    if seconds < 86400:
+        return f"{seconds // 3600} h ago"
+    return f"{seconds // 86400} d ago"
+
+
+def _duration(seconds: float) -> str:
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _signal_bars(percent: int) -> str:
+    if percent < 0:
+        return "unknown"
+    filled = min(4, (percent + 24) // 25)
+    return "▂▄▆█"[:filled] + "░" * (4 - filled) + f" {percent}%"
+
+
+def fetch_dashboard_stats() -> dict | None:
+    """Collect inbox, outbox and modem stats. Returns None if the DB is unreachable."""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    cursor = conn.cursor(dictionary=True)
+    stats: dict = {}
+    try:
+        cursor.execute("SELECT NOW() AS now")
+        now = cursor.fetchone()['now']
+        stats['now'] = now
+
+        cursor.execute("""
+            SELECT ID, SenderNumber, TextDecoded, ReceivingDateTime, Processed, UDH
+            FROM inbox
+        """)
+        messages = assemble_inbox_rows(cursor.fetchall())
+        week_ago = now - timedelta(days=7)
+        stats['total'] = len(messages)
+        stats['unread'] = sum(1 for m in messages if m.get('Processed') == 'false')
+        stats['today'] = sum(1 for m in messages if m.get('ReceivingDateTime') and m['ReceivingDateTime'].date() == now.date())
+        stats['week'] = sum(1 for m in messages if m.get('ReceivingDateTime') and m['ReceivingDateTime'] >= week_ago)
+        stats['latest'] = messages[0] if messages else None
+        stats['top_senders'] = Counter(
+            m['SenderNumber'] for m in messages
+            if m.get('ReceivingDateTime') and m['ReceivingDateTime'] >= week_ago
+        ).most_common(3)
+    except mysql.connector.Error as err:
+        logger.error("Dashboard inbox query failed: %s", err)
+        cursor.close()
+        conn.close()
+        return None
+
+    # Optional Gammu tables: missing tables shouldn't break the dashboard
+    try:
+        cursor.execute("SELECT COUNT(*) AS n FROM outbox")
+        stats['outbox'] = cursor.fetchone()['n']
+    except mysql.connector.Error:
+        stats['outbox'] = None
+    try:
+        cursor.execute("""
+            SELECT ID, NetName, NetCode, `Signal`, Battery, Sent, Received, UpdatedInDB,
+                   TimeOut >= NOW() AS online
+            FROM phones
+            ORDER BY UpdatedInDB DESC
+        """)
+        stats['phones'] = cursor.fetchall()
+    except mysql.connector.Error:
+        stats['phones'] = None
+    finally:
+        cursor.close()
+        conn.close()
+    return stats
+
+
+def format_dashboard(stats: dict | None) -> str:
+    """Render dashboard stats as Telegram HTML."""
+    e = html.escape
+    lines = ["📊 <b>SMS Dashboard</b>"]
+
+    if stats is None:
+        lines += ["", "❌ <b>Database unreachable</b>", f"<code>{e(DB_NAME or 'unknown')} @ {e(DB_HOST)}</code>"]
+        return "\n".join(lines)
+
+    now = stats['now']
+    lines.append(f"<i>Updated {now.strftime('%H:%M:%S')}</i>")
+
+    lines += ["", "📬 <b>Inbox</b>"]
+    unread = stats['unread']
+    lines.append(f"• Unread: <b>{unread}</b>" + (" 🔔" if unread else ""))
+    lines.append(f"• Total: {stats['total']}")
+    lines.append(f"• Today: {stats['today']} · Last 7 days: {stats['week']}")
+    latest = stats['latest']
+    if latest and latest.get('ReceivingDateTime'):
+        lines.append(
+            f"• Last received: {_ago(now - latest['ReceivingDateTime'])} "
+            f"from <code>{e(str(latest['SenderNumber']))}</code>"
+        )
+    if stats['outbox']:
+        lines.append(f"• Outbox: {stats['outbox']} queued")
+
+    if stats['top_senders']:
+        lines += ["", "👥 <b>Top senders (7 days)</b>"]
+        for i, (sender, count) in enumerate(stats['top_senders'], 1):
+            lines.append(f"{i}. <code>{e(str(sender))}</code> — {count}")
+
+    lines += ["", "📶 <b>Modem</b>"]
+    phones = stats['phones']
+    if phones is None:
+        lines.append("• No modem info (phones table unavailable)")
+    elif not phones:
+        lines.append("• ⚠️ No modem has reported in. Is gammu-smsd running?")
+    else:
+        for ph in phones:
+            status = "🟢 Online" if ph['online'] else "🔴 Offline"
+            lines.append(f"{status} · <code>{e(str(ph['ID']))}</code>")
+            net = ph.get('NetName') or 'unknown'
+            if ph.get('NetCode') and ph['NetCode'] != 'ERROR':
+                net += f" ({ph['NetCode']})"
+            lines.append(f"• Network: {e(net)}")
+            signal = f"• Signal: {_signal_bars(ph['Signal'])}"
+            if ph['Battery'] and ph['Battery'] > 0:
+                signal += f" · Battery: {ph['Battery']}%"
+            lines.append(signal)
+            lines.append(f"• Sent: {ph['Sent']} · Received: {ph['Received']}")
+            if ph.get('UpdatedInDB'):
+                lines.append(f"• Last seen: {_ago(now - ph['UpdatedInDB'])}")
+
+    lines += [
+        "",
+        "🖥 <b>System</b>",
+        f"• Server: {e(socket.gethostname())} ({e(get_server_ip())})",
+        f"• Database: <code>{e(DB_NAME or 'unknown')} @ {e(DB_HOST)}</code>",
+        f"• Bot uptime: {_duration(time.time() - BOT_STARTED_AT)}",
+    ]
+    return "\n".join(lines)
+
+
+def _is_public_url(url: str) -> bool:
+    """Telegram rejects URL buttons pointing at localhost/loopback addresses."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return False
+        if parsed.hostname == 'localhost':
+            return False
+        try:
+            return not ipaddress.ip_address(parsed.hostname).is_loopback
+        except ValueError:
+            return True
+    except Exception:
+        return False
+
+
+def dashboard_keyboard(stats: dict | None, with_url: bool = True) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("🔄 Refresh", callback_data="dash_refresh")]]
+    if stats and stats['unread']:
+        rows[0].append(InlineKeyboardButton(f"📬 Show unread ({stats['unread']})", callback_data="dash_unread"))
+        rows.append([InlineKeyboardButton("✅ Mark all as read", callback_data="dash_readall")])
+    if with_url and _is_public_url(APP_PUBLIC_URL):
+        rows.append([InlineKeyboardButton("🌐 Open web dashboard", url=APP_PUBLIC_URL)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_or_edit_dashboard(update: Update, edit: bool):
+    stats = fetch_dashboard_stats()
+    text = format_dashboard(stats)
+    if stats is not None and not _is_public_url(APP_PUBLIC_URL):
+        text += f"\n• Web: <code>{html.escape(APP_PUBLIC_URL)}</code>"
+
+    async def send(with_url: bool):
+        keyboard = dashboard_keyboard(stats, with_url)
+        if edit:
+            await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+        else:
+            await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+    try:
+        await send(with_url=True)
+    except BadRequest as err:
+        if "not modified" in str(err).lower():
+            return
+        # Most likely Telegram rejected the dashboard URL; retry without the button
+        logger.warning("Dashboard send failed (%s); retrying without URL button", err)
+        await send(with_url=False)
+
+
+async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_or_edit_dashboard(update, edit=False)
+
+
+async def handle_dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str):
+    query = update.callback_query
+
+    if payload == 'refresh':
+        await query.answer("Refreshed")
+        await _send_or_edit_dashboard(update, edit=True)
+    elif payload == 'unread':
+        await query.answer()
+        await send_unread_messages(query.message)
+    elif payload == 'readall':
+        await query.answer()
+        await query.edit_message_reply_markup(InlineKeyboardMarkup([[
+            InlineKeyboardButton("Yes, mark all as read", callback_data="dash_readallyes"),
+            InlineKeyboardButton("Cancel", callback_data="dash_refresh"),
+        ]]))
+    elif payload == 'readallyes':
+        ids = mark_all_as_read()
+        if ids is None:
+            await query.answer("Database error — nothing changed.", show_alert=True)
+            return
+        remove_sent_ids(ids)
+        await query.answer("All messages marked as read.")
+        await _send_or_edit_dashboard(update, edit=True)
+    else:
+        await query.answer()
+
+
 MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📥 Last 5 Messages"), KeyboardButton("📥 Last 10 Messages")],
+        [KeyboardButton("📬 Unread Messages"), KeyboardButton("📥 Last 10 Messages")],
         [KeyboardButton("📊 Dashboard"), KeyboardButton("❓ Help")]
     ],
     resize_keyboard=True
@@ -173,16 +457,18 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text
-    if text == "📥 Last 5 Messages":
-        await cmd_last5(update, context)
+    if text == "📬 Unread Messages":
+        await cmd_unread(update, context)
     elif text == "📥 Last 10 Messages":
-        await cmd_last10(update, context)
+        await show_last10(update, context)
+    # Old keyboard button, still shown in chats until /menu is sent again
+    elif text == "📥 Last 5 Messages":
+        await cmd_last5(update, context)
     elif text == "📊 Dashboard":
-        app_url = os.environ.get("APP_PUBLIC_URL", "http://127.0.0.1:5000")
-        await update.effective_message.reply_text(f"Dashboard: {app_url}")
+        await cmd_dashboard(update, context)
     elif text == "❓ Help":
         await update.effective_message.reply_text(
-            "Available commands:\n/menu - Show menu\n/last5 - Last 5 messages\n/last10 - Last 10 messages\n/start - Bot info"
+            "Available commands:\n/menu - Show menu\n/dashboard - Inbox, modem and system status\n/unread - Unread messages\n/last5 - Last 5 messages\n/start - Bot info"
         )
     else:
         await update.effective_message.reply_text("Unknown option. Use /menu to see available actions.")
@@ -218,30 +504,76 @@ def fetch_last_messages(limit=5):
     return messages
 
 
-async def send_messages_with_button(update: Update, context: ContextTypes.DEFAULT_TYPE, limit: int):
-    """Helper to fetch and send messages with a 'Mark as Read' button."""
-    messages = fetch_last_messages(limit)
-    if not messages:
-        await update.effective_message.reply_text("No recent messages found.")
-        return
+def fetch_unread_messages():
+    """Fetch all unread messages (multipart assembled), newest first."""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT ID, SenderNumber, TextDecoded, ReceivingDateTime, Processed, UDH
+            FROM inbox
+            WHERE Processed = 'false'
+        """)
+        return assemble_inbox_rows(cursor.fetchall())
+    except mysql.connector.Error as err:
+        logger.error("Failed to fetch unread messages: %s", err)
+        return []
+    finally:
+        cursor.close()
+        conn.close()
 
+
+async def send_message_list(target_message, messages):
+    """Reply with each message (oldest first) and Mark as Read / Delete buttons for unread ones."""
     for m in reversed(messages):
         status = "✅" if m['Processed'] == 'true' else "🆕"
         text = f"{status} From: {m['SenderNumber']}\n{m['TextDecoded']}\nReceived: {m['ReceivingDateTime']}"
 
         keyboard = None
         if m['Processed'] == 'false':
+            ids = callback_ids(m)
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("Mark as Read", callback_data=f"read_{m['ID']}"),
-                    InlineKeyboardButton("Delete", callback_data=f"delete_{m['ID']}")
+                    InlineKeyboardButton("Mark as Read", callback_data=f"read_{ids}"),
+                    InlineKeyboardButton("Delete", callback_data=f"delete_{ids}")
                 ]
             ])
 
-        await update.effective_message.reply_text(text, reply_markup=keyboard)
+        await target_message.reply_text(text, reply_markup=keyboard)
 
 
-async def cmd_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_messages_with_button(update: Update, context: ContextTypes.DEFAULT_TYPE, limit: int):
+    """Helper to fetch and send messages with a 'Mark as Read' button."""
+    messages = fetch_last_messages(limit)
+    if not messages:
+        await update.effective_message.reply_text("No recent messages found.")
+        return
+    await send_message_list(update.effective_message, messages)
+
+
+UNREAD_LIST_LIMIT = 10
+
+
+async def send_unread_messages(target_message):
+    """Reply with the newest unread messages, each with Mark as Read / Delete buttons."""
+    messages = fetch_unread_messages()
+    if not messages:
+        await target_message.reply_text("🎉 No unread messages.")
+        return
+    await send_message_list(target_message, messages[:UNREAD_LIST_LIMIT])
+    if len(messages) > UNREAD_LIST_LIMIT:
+        await target_message.reply_text(
+            f"Showing the latest {UNREAD_LIST_LIMIT} of {len(messages)} unread messages."
+        )
+
+
+async def cmd_unread(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_unread_messages(update.effective_message)
+
+
+async def show_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_messages_with_button(update, context, 10)
 
 
@@ -344,8 +676,8 @@ def send_message_to_telegram(message):
         keyboard = {
             "inline_keyboard": [
                 [
-                    {"text": "Mark as Read", "callback_data": f"read_{message['ID']}"},
-                    {"text": "Delete", "callback_data": f"delete_{message['ID']}"}
+                    {"text": "Mark as Read", "callback_data": f"read_{callback_ids(message)}"},
+                    {"text": "Delete", "callback_data": f"delete_{callback_ids(message)}"}
                 ]
             ]
         }
@@ -370,8 +702,8 @@ def send_message_to_telegram(message):
             keyboard = {
                 "inline_keyboard": [
                     [
-                        {"text": "Mark as Read", "callback_data": f"read_{message['ID']}"},
-                        {"text": "Delete", "callback_data": f"delete_{message['ID']}"}
+                        {"text": "Mark as Read", "callback_data": f"read_{callback_ids(message)}"},
+                        {"text": "Delete", "callback_data": f"delete_{callback_ids(message)}"}
                     ]
                 ]
             }
@@ -465,9 +797,10 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("last10", cmd_last10))
+    app.add_handler(CommandHandler("unread", cmd_unread))
     app.add_handler(CommandHandler("last5", cmd_last5))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("dashboard", cmd_dashboard))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_choice))
 
