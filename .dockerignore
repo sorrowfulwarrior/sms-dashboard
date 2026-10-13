@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+.env
+.env.*
+**/__pycache__
+**/*.pyc
+**/message_ids.txt
+tests
+gammu.sql
+*.md

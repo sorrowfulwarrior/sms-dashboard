@@ -36,7 +36,7 @@ DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_NAME = os.environ.get("DB_NAME", "")
 DB_USER = os.environ.get("DB_USER")
 DB_PASSWORD = os.environ.get("DB_PASSWORD")
-SENT_IDS_FILE = os.path.join(os.path.dirname(__file__), "message_ids.txt")
+SENT_IDS_FILE = os.environ.get("SENT_IDS_FILE") or os.path.join(os.path.dirname(__file__), "message_ids.txt")
 
 
 def get_db_connection():

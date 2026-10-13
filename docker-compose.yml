@@ -1,0 +1,38 @@
+# Dashboard + Telegram bot, attached to the docker-gammu stack's network so
+# they reach its MariaDB as `db`. Start docker-gammu first.
+#
+#   docker compose up -d --build
+#
+# Settings: .env (Telegram, SECRET_KEY, ...) then .env.docker, which overrides
+# the DB connection with the container's credentials.
+x-app: &app
+  build: .
+  image: local/sms-dashboard:latest
+  restart: unless-stopped
+  env_file:
+    - .env
+    - .env.docker
+  networks:
+    - gammu
+
+services:
+  web:
+    <<: *app
+    ports:
+      - "${DASHBOARD_PORT:-5000}:5000"
+
+  bot:
+    <<: *app
+    command: ["python", "-m", "sms-dashboard.bot"]
+    healthcheck:
+      disable: true
+    volumes:
+      - bot_data:/data
+
+networks:
+  gammu:
+    name: docker-gammu_default
+    external: true
+
+volumes:
+  bot_data:
